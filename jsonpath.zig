@@ -123,7 +123,7 @@
 const std = @import("std");
 const zbench = @import("zbench");
 const json = std.json;
-const print = std.log.debug;
+const print = std.log.warn;
 const testing = std.testing;
 
 // Extend this type with the OutOfMemory error from std.mem
@@ -693,10 +693,8 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, path: []u8, value: *const 
         switch (char) {
             // Case 1: We are going to try to select a single next node base on the proceeding key
             '.' => {
-                // Error if not an object
-                if (current_node.* != .object) {
-                    return undefined;
-                }
+                const current_node_str = try json.stringifyAlloc(allocator, current_node.*, .{});
+                print("Evaluating next node, current node: {s}\n", .{current_node_str});
                 // Read the key for the next node (exit loop if ., [, ], or *)
                 path_index += 1;
                 if (path_index >= path.len) {
@@ -705,6 +703,10 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, path: []u8, value: *const 
                 char = path[path_index];
                 // '..' - evaluate all keys in the current node
                 if (char == '.') {
+                    // Error if not an object
+                    if (current_node.* != .object) {
+                        return undefined;
+                    }
                     print("Evaluating all keys in current node\n", .{});
                     // If current node is not an object, then return undefined
                     if (current_node.* != .object) {
@@ -720,6 +722,24 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, path: []u8, value: *const 
                         evaluated_keys.append(evaluated_key.?) catch return JsonPathError.OutOfMemory;
                     }
                     return json.Value{ .array = evaluated_keys };
+                } else if (char == '*') { // Select all children of the current node
+                    // If the current node is an array, then we will return all of the items in the array
+                    if (current_node.* == .array) {
+                        print("Selecting all children of current node, current node is array: {s}\n", .{current_node_str});
+                        return current_node.*;
+                    }
+                    // If the current node is an object, then we will return all of the values of all of the children
+                    if (current_node.* == .object) {
+                        var new_array = std.ArrayList(json.Value).init(allocator);
+                        for (current_node.object.values()) |v| {
+                            new_array.append(v) catch return JsonPathError.OutOfMemory;
+                        }
+                        return json.Value{ .array = new_array };
+                    }
+                }
+                // Error if not an object
+                if (current_node.* != .object) {
+                    return undefined;
                 }
                 while (char != '.' and char != '[' and char != ']' and char != '*' and path_index < path.len) {
                     node_name_buffer.append(char) catch return JsonPathError.OutOfMemory;
@@ -744,6 +764,7 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, path: []u8, value: *const 
                 // Clear node_name_buffer
                 node_name_buffer.clearRetainingCapacity();
             },
+            // Case 2: Selector
             '[' => {
                 print("Evaluating selector, char: {c}\n", .{char});
                 path_index += 1;
@@ -1218,6 +1239,20 @@ test "basic picking" {
     try testing.expectEqual(std.mem.eql(u8, result.?.array.items[1].object.get("author").?.string, "Herman Melville"), true);
 }
 
+test "get single item from array" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Parsed(json.Value) = undefined;
+    root_json = try json.parseFromSlice(json.Value, alloc,
+        \\[1, 2, 3, 4, 5]
+    , .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$[0]");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json.value, .{});
+    try testing.expectEqual(result.?.array.items[0].integer, 1);
+}
+
 test "basic expression selector" {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
@@ -1247,4 +1282,52 @@ test "expression selector with nested groups" {
     print("result: {s}\n", .{result_string});
     try testing.expectEqual(result.?.array.items.len, 1);
     try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[0].object.get("isbn").?.string, "0-553-21311-4"));
+}
+
+test "wildcard select all object children" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Parsed(json.Value) = undefined;
+    root_json = try json.parseFromSlice(json.Value, alloc, book_store_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.store.*");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json.value, .{});
+    const result_string = json.stringifyAlloc(alloc, result.?, .{}) catch return;
+    print("result: {s}\n", .{result_string});
+    // One of these children should be an array with 4 items, the other should be an object with color = red and price = 399
+    var array_found = false;
+    var object_found = false;
+    for (result.?.array.items) |item| {
+        switch (item) {
+            .array => {
+                array_found = true;
+                try testing.expectEqual(item.array.items.len, 4);
+            },
+            .object => {
+                object_found = true;
+                try testing.expectEqual(true, std.mem.eql(u8, item.object.get("color").?.string, "red"));
+                try testing.expectEqual(item.object.get("price").?.integer, 399);
+            },
+            else => {
+                try testing.expect(false);
+            },
+        }
+    }
+    try testing.expectEqual(array_found, true);
+    try testing.expectEqual(object_found, true);
+}
+
+test "wildcard select all elements of array" {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Parsed(json.Value) = undefined;
+    root_json = try json.parseFromSlice(json.Value, alloc, book_store_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.store.book.*");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json.value, .{});
+    const result_string = json.stringifyAlloc(alloc, result.?, .{}) catch return;
+    print("result: {s}\n", .{result_string});
+    try testing.expectEqual(result.?.array.items.len, 4);
 }

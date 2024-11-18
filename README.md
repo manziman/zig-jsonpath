@@ -6,3 +6,6 @@ A Zig JSONPath library that implements the IETF RFC 9535.
 - [ ] Implement selector filter for objects in addition to arrays
 - [ ] Implement builtin functions (length, count, match, search, value)
 - [ ] Release automation
+- [ ] Add inline documentation
+- [ ] Add tests for all examples in the RFC
+- [ ] Make error types conform to what is defined in the RFC

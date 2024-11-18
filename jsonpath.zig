@@ -616,7 +616,7 @@ const books_json =
 ;
 
 test "basic logical expression (string comparison)" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     // Use book store JSON, find books by author
@@ -644,7 +644,7 @@ test "basic logical expression (string comparison)" {
 }
 
 test "basic logical expression (float comparison)" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1089,7 +1089,7 @@ const book_store_json =
 ;
 
 test "root query 2" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1110,7 +1110,7 @@ test "root query 2" {
 }
 
 test "basic jsonpath 2" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1129,7 +1129,7 @@ test "basic jsonpath 2" {
 }
 
 test "array of integers" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1145,7 +1145,7 @@ test "array of integers" {
 }
 
 test "basic slicing" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1184,7 +1184,7 @@ test "basic slicing" {
 }
 
 test "slicing and getting nested values from sliced array" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1200,7 +1200,7 @@ test "slicing and getting nested values from sliced array" {
 }
 
 test "using [''] syntax for selecting keys" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1218,7 +1218,7 @@ test "using [''] syntax for selecting keys" {
 }
 
 test "basic picking" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1232,7 +1232,7 @@ test "basic picking" {
 }
 
 test "get single item from array" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1246,7 +1246,7 @@ test "get single item from array" {
 }
 
 test "basic expression selector" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1260,7 +1260,7 @@ test "basic expression selector" {
 }
 
 test "expression selector with nested groups" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1273,7 +1273,7 @@ test "expression selector with nested groups" {
 }
 
 test "wildcard select all object children" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;
@@ -1305,7 +1305,7 @@ test "wildcard select all object children" {
 }
 
 test "wildcard select all elements of array" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
     var root_json: json.Value = undefined;

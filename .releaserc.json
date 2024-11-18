@@ -7,11 +7,6 @@
     "@semantic-release/commit-analyzer",
     "@semantic-release/release-notes-generator",
     "@semantic-release/changelog",
-    [
-      "@semantic-release/github",
-      {
-        "assets": ["*.zig", "build.zig.zon", "LICENSE", "README.md"]
-      }
-    ]
+    "@semantic-release/github"
   ]
 }

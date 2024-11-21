@@ -124,6 +124,7 @@ const std = @import("std");
 const zbench = @import("zbench");
 const json = std.json;
 const printErr = std.log.err;
+//const printWarn = std.log.warn;
 const testing = std.testing;
 
 // Extend this type with the OutOfMemory error from std.mem
@@ -727,17 +728,28 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, path: []u8, value: *const 
                     }
                     return json.Value{ .array = evaluated_keys };
                 } else if (char == '*') { // Select all children of the current node
+                    path_index += 1;
+                    var result_array = std.ArrayList(json.Value).init(allocator);
                     // If the current node is an array, then we will return all of the items in the array
                     if (current_node.* == .array) {
-                        return current_node.*;
-                    }
-                    // If the current node is an object, then we will return all of the values of all of the children
-                    if (current_node.* == .object) {
-                        var new_array = std.ArrayList(json.Value).init(allocator);
-                        for (current_node.object.values()) |v| {
-                            new_array.append(v) catch return JsonPathError.OutOfMemory;
+                        // Recursively evaluate the path for each item in the array
+                        for (current_node.array.items) |item| {
+                            const evaluated_item = try evaluateJsonPath(allocator, path[path_index..], &item, .{ .skip_root = true });
+                            if (evaluated_item != null) {
+                                result_array.append(evaluated_item.?) catch return JsonPathError.OutOfMemory;
+                            }
                         }
-                        return json.Value{ .array = new_array };
+                        return json.Value{ .array = result_array };
+                    }
+                    // If the current node is an object, then we will evaluate the remaining path for each child
+                    if (current_node.* == .object) {
+                        for (current_node.object.values()) |v| {
+                            const evaluated_item = try evaluateJsonPath(allocator, path[path_index..], &v, .{ .skip_root = true });
+                            if (evaluated_item != null) {
+                                result_array.append(evaluated_item.?) catch return JsonPathError.OutOfMemory;
+                            }
+                        }
+                        return json.Value{ .array = result_array };
                     }
                 }
                 // Error if not an object
@@ -820,10 +832,6 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, path: []u8, value: *const 
                     path_index += 1;
                     continue :ev;
                 }
-                // First check if the current node is even an array. If it isn't, then we will return undefined
-                if (current_node.* != .array) {
-                    return undefined;
-                }
                 var selector_type: SelectorType = .Unknown;
                 const selector_expression_start_index = path_index;
                 // Read through the entire selector expression (until we hit a ])
@@ -878,6 +886,10 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, path: []u8, value: *const 
                 var sliced_array = std.ArrayList(json.Value).init(allocator);
                 switch (selector_type) {
                     .Slice => {
+                        // Must be Array
+                        if (current_node.* != .array) {
+                            return undefined;
+                        }
                         // Read through the expression, getting a start, end, and step
                         // If the step is not defined, then it is 1
                         // If the start is not defined, then it is 0
@@ -969,6 +981,10 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, path: []u8, value: *const 
                         return json.Value{ .array = sliced_array };
                     },
                     .Pick => {
+                        // Must be Array
+                        if (current_node.* != .array) {
+                            return undefined;
+                        }
                         // Loop through the pick list and add the corresponding items to the array
                         var pick_items = std.ArrayList(u64).init(allocator);
                         var selector_expression_index: u64 = selector_expression_start_index;
@@ -1014,6 +1030,10 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, path: []u8, value: *const 
                         return json.Value{ .array = sliced_array };
                     },
                     .Expression => {
+                        // Can be Array or Object
+                        if (current_node.* != .array and current_node.* != .object) {
+                            return undefined;
+                        }
                         // Evaluate the expression
                         // Go through each item in the array and evaluate the expression
                         // If the expression is true for any item, then add it to the array
@@ -1027,6 +1047,10 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, path: []u8, value: *const 
                         return json.Value{ .array = sliced_array };
                     },
                     .All => {
+                        // Can be Array or Object
+                        if (current_node.* != .array and current_node.* != .object) {
+                            return undefined;
+                        }
                         // Loop through all of the items in the current node and evaluate the rest of the path
                         path_index += 1;
                         for (current_node.array.items) |item| {
@@ -1314,4 +1338,17 @@ test "wildcard select all elements of array" {
     try path.appendSlice("$.store.book.*");
     const result = try evaluateJsonPath(alloc, path.items, &root_json, .{});
     try testing.expectEqual(result.?.array.items.len, 4);
+}
+
+test "wildcard select subpath in child object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, book_store_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.store.*.price");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(1, result.?.array.items.len);
+    try testing.expectEqual(399, result.?.array.items[0].integer);
 }

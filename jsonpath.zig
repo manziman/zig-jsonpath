@@ -133,7 +133,10 @@ pub const JsonPathError = error{
     OutOfMemory, // Memory allocation failed
     InvalidLogicalExpression, // Invalid logical expression
     InvalidOperator, // Operator not supported for given types
+    InvalidComparison, // Invalid comparison between types
     ComparisonTypeMismatch, // Comparison between different types
+    BuiltinNotFound, // Builtin not found
+    InvalidBuiltinFunctionArgument, // Invalid builtin argument
 };
 
 const Operator = enum {
@@ -151,13 +154,38 @@ const Operator = enum {
 
 // Struct to contain either a primitive value or an operator
 const LogicalExpressionComponent = union(enum) {
-    value: json.Value, // Either a string or a number
+    value: ?json.Value, // Either a string or a number
     operator: Operator,
 };
 
+// The length() builtin expression function
+// For strings, it returns the number of characters
+// For arrays, it returns the number of elements
+// For objects, it returns the number of keys
+fn lengthBuiltin(value: *const json.Value) ?json.Value {
+    switch (value.*) {
+        .string => return json.Value{ .integer = @intCast(value.string.len) },
+        .array => return json.Value{ .integer = @intCast(value.array.items.len) },
+        .object => return json.Value{ .integer = @intCast(value.object.keys().len) },
+        else => return null,
+    }
+}
+
+// The count() builtin expression function
+// Only for arrays
+fn countBuiltin(value: *const json.Value) ?json.Value {
+    if (value.* != .array) {
+        return null;
+    }
+    return json.Value{ .integer = @intCast(value.array.items.len) };
+}
+
 // Given a JSON value, return a string name for the type of value it contains
-fn valueTypeName(value: *const json.Value) []const u8 {
-    return switch (value.*) {
+fn valueTypeName(value: *const ?json.Value) []const u8 {
+    if (value.* == null) {
+        return "null";
+    }
+    return switch (value.*.?) {
         .bool => "boolean",
         .integer => "integer",
         .float => "float",
@@ -170,17 +198,17 @@ fn valueTypeName(value: *const json.Value) []const u8 {
 }
 
 // Compare values that could be integers or floats
-fn compareNumericValues(left: *json.Value, right: *json.Value, operator: *Operator) JsonPathError!bool {
+fn compareNumericValues(left: json.Value, right: json.Value, operator: *Operator) JsonPathError!bool {
     // Convert both values to float
-    const left_float = switch (left.*) {
+    const left_float = switch (left) {
         .integer => @as(f64, @floatFromInt(left.integer)),
         .float => left.float,
-        else => return JsonPathError.InvalidLogicalExpression,
+        else => return JsonPathError.ComparisonTypeMismatch,
     };
-    const right_float = switch (right.*) {
+    const right_float = switch (right) {
         .integer => @as(f64, @floatFromInt(right.integer)),
         .float => right.float,
-        else => return JsonPathError.InvalidLogicalExpression,
+        else => return JsonPathError.ComparisonTypeMismatch,
     };
     switch (operator.*) {
         .Equals => return left_float == right_float,
@@ -189,7 +217,7 @@ fn compareNumericValues(left: *json.Value, right: *json.Value, operator: *Operat
         .LessThan => return left_float < right_float,
         .GreaterThanOrEqualTo => return left_float >= right_float,
         .LessThanOrEqualTo => return left_float <= right_float,
-        else => return JsonPathError.InvalidLogicalExpression,
+        else => return JsonPathError.InvalidComparison,
     }
 }
 
@@ -210,7 +238,7 @@ fn compareStringValues(left: []const u8, right: []const u8, operator: *Operator)
         switch (operator.*) {
             .GreaterThan => return left[index] > right[index],
             .LessThan => return left[index] < right[index],
-            else => return JsonPathError.InvalidLogicalExpression,
+            else => return JsonPathError.InvalidComparison,
         }
         index += 1;
     }
@@ -222,41 +250,48 @@ fn compareStringValues(left: []const u8, right: []const u8, operator: *Operator)
     }
 }
 
-fn compareBooleanValues(left: *json.Value, right: *json.Value, operator: *Operator) JsonPathError!bool {
+fn compareBooleanValues(left: json.Value, right: json.Value, operator: *Operator) JsonPathError!bool {
     switch (operator.*) {
         .Equals => return left.bool == right.bool,
         .NotEquals => return left.bool != right.bool,
         .And => return left.bool and right.bool,
         .Or => return left.bool or right.bool,
-        else => return JsonPathError.InvalidLogicalExpression,
+        else => return false,
     }
 }
 
 // Generic function to compare two values using an operator
-fn compareTwoValues(left: *json.Value, right: *json.Value, operator: *Operator) JsonPathError!bool {
-    switch (left.*) {
+fn compareTwoValues(left: *?json.Value, right: *?json.Value, operator: *Operator) JsonPathError!bool {
+    // If either value is null, then the only case where the comparison is true is if the operator is Equals
+    if (left.* == null or right.* == null) {
+        switch (operator.*) {
+            .Equals => return left.* == null and right.* == null,
+            else => return false,
+        }
+    }
+    switch (left.*.?) {
         .integer, .float => {
-            switch (right.*) {
-                .integer, .float => return compareNumericValues(left, right, operator),
+            switch (right.*.?) {
+                .integer, .float => return compareNumericValues(left.*.?, right.*.?, operator),
                 else => {
-                    printErr("invalid logical expression: comparison between {any} and {any}\n", .{ valueTypeName(left), valueTypeName(right) });
-                    return JsonPathError.InvalidLogicalExpression;
+                    printErr("invalid logical expression: comparison between {s} and {s}\n", .{ valueTypeName(left), valueTypeName(right) });
+                    return false;
                 },
             }
         },
         .bool => {
-            switch (right.*) {
-                .bool => return compareBooleanValues(left, right, operator),
-                else => return JsonPathError.InvalidLogicalExpression,
+            switch (right.*.?) {
+                .bool => return compareBooleanValues(left.*.?, right.*.?, operator),
+                else => return false,
             }
         },
         .string => {
-            switch (right.*) {
-                .string => return compareStringValues(left.string, right.string, operator),
-                else => return JsonPathError.InvalidLogicalExpression,
+            switch (right.*.?) {
+                .string => return compareStringValues(left.*.?.string, right.*.?.string, operator),
+                else => return false,
             }
         },
-        else => return JsonPathError.InvalidLogicalExpression,
+        else => return false,
     }
 }
 
@@ -269,7 +304,7 @@ fn evaluateLogicalExpression(expression: []LogicalExpressionComponent) JsonPathE
     // Evaluate chain of operators and values
     // e.g. [{"value":"Nigel Rees"},{"operator":"Equals"},{"value":"Nigel Rees"},{"operator":"Or"},{"value":"Nigel Rees"},{"operator":"Equals"},{"value":"Herman Melville"}]
     var index: u64 = 0;
-    var previous_value: *json.Value = undefined;
+    var previous_value: *?json.Value = undefined;
     var final_result: ?bool = undefined;
     var operator: Operator = .Unset;
     var and_or_operator: Operator = .Unset;
@@ -284,9 +319,9 @@ fn evaluateLogicalExpression(expression: []LogicalExpressionComponent) JsonPathE
             .value => {
                 switch (operator) {
                     .Not => {
-                        switch (expression[index].value) {
+                        switch (expression[index].value.?) {
                             .bool => {
-                                final_result = !expression[index].value.bool;
+                                final_result = !expression[index].value.?.bool;
                             },
                             else => {
                                 printErr("invalid logical expression: ! operator must be followed by boolean\n", .{});
@@ -402,7 +437,8 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                 const evaluated_value = try evaluateJsonPath(allocator, expression_slice, value, .{ .skip_root = true });
                 // If the evaluated value is null, then return false
                 if (evaluated_value == null) {
-                    return false;
+                    logical_expressions.append(.{ .value = null }) catch return JsonPathError.OutOfMemory;
+                    continue :ex;
                 }
                 logical_expressions.append(.{ .value = evaluated_value.? }) catch return JsonPathError.OutOfMemory;
                 continue :ex;
@@ -562,23 +598,133 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                 logical_expressions.append(.{ .value = json.Value.parseFromNumberSlice(number_buffer.items) }) catch return JsonPathError.OutOfMemory;
                 continue :ex;
             },
-            't' => { // could be true
-                expression_index += 1;
-                // Check if the following characters are true
-                if (expression_index + 3 < expression.len and expression[expression_index] == 'r' and expression[expression_index + 1] == 'u' and expression[expression_index + 2] == 'e') {
-                    expression_index += 3;
-                    logical_expressions.append(.{ .value = json.Value{ .bool = true } }) catch return JsonPathError.OutOfMemory;
-                    continue :ex;
+            // If we hit any lowercase alphabetic character, we will check if it matches one of the "builtins" (i.e. true, false, or a function - length, count, match, search, value)
+            'a'...'z' => {
+                // continue reading until we hit a non-alphabetic character
+                var builtin_name_buffer = std.ArrayList(u8).init(allocator);
+                var expr_char = expression[expression_index];
+                while (expression_index < expression.len and expr_char >= 'a' and expr_char <= 'z') {
+                    builtin_name_buffer.append(expr_char) catch return JsonPathError.OutOfMemory;
+                    expression_index += 1;
+                    if (expression_index < expression.len) {
+                        expr_char = expression[expression_index];
+                    }
                 }
-                return JsonPathError.InvalidPath;
-            },
-            'f' => { // could be false
-                expression_index += 1;
-                // Check if the following characters are false
-                if (expression_index + 4 < expression.len and expression[expression_index] == 'a' and expression[expression_index + 1] == 'l' and expression[expression_index + 2] == 's' and expression[expression_index + 3] == 'e') {
-                    expression_index += 4;
+                // Check if the builtin name matches one of the builtins
+                // All functions must be followed by a parentheses-enclosed
+                if (std.mem.eql(u8, builtin_name_buffer.items, "true")) {
+                    logical_expressions.append(.{ .value = json.Value{ .bool = true } }) catch return JsonPathError.OutOfMemory;
+                } else if (std.mem.eql(u8, builtin_name_buffer.items, "false")) {
                     logical_expressions.append(.{ .value = json.Value{ .bool = false } }) catch return JsonPathError.OutOfMemory;
-                    continue :ex;
+                } else if (std.mem.eql(u8, builtin_name_buffer.items, "length")) {
+                    // length()
+                    if (expression_index >= expression.len) {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    if (expression[expression_index] != '(') {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    expression_index += 1;
+                    if (expression_index >= expression.len) {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    // Next should either be a @ indicating an expression or a ' indicating a string
+                    switch (expression[expression_index]) {
+                        '@' => {
+                            expression_index += 1;
+                            // Read the entire expression until we hit a closing ')' and evaluate it
+                            var expression_buffer = std.ArrayList(u8).init(allocator);
+                            while (expression_index < expression.len and (expression[expression_index] != ')')) {
+                                expression_buffer.append(expression[expression_index]) catch return JsonPathError.OutOfMemory;
+                                expression_index += 1;
+                            }
+                            if (expression_index >= expression.len) {
+                                return JsonPathError.InvalidLogicalExpression;
+                            }
+                            if (expression[expression_index] != ')') {
+                                return JsonPathError.InvalidLogicalExpression;
+                            }
+                            expression_index += 1;
+                            const evaluated_value = try evaluateJsonPath(allocator, expression_buffer.items, value, .{ .skip_root = true });
+                            if (evaluated_value == null) {
+                                return false;
+                            }
+                            // Now get the length of the evaluated value
+                            const length = lengthBuiltin(&evaluated_value.?);
+                            if (length == null) {
+                                return false;
+                            }
+                            logical_expressions.append(.{ .value = length.? }) catch return JsonPathError.OutOfMemory;
+                        },
+                        '\'' => {
+                            expression_index += 1;
+                            // Read the entire string until we hit another '
+                            var string_buffer = std.ArrayList(u8).init(allocator);
+                            var escape_next_char: bool = false;
+                            expr_char = expression[expression_index];
+                            while (expression_index < expression.len and (expr_char != '\'' or escape_next_char)) {
+                                if (expr_char == '\\') {
+                                    escape_next_char = true;
+                                } else {
+                                    string_buffer.append(expr_char) catch return JsonPathError.OutOfMemory;
+                                    escape_next_char = false;
+                                }
+                                expression_index += 1;
+                                if (expression_index < expression.len) {
+                                    expr_char = expression[expression_index];
+                                }
+                            }
+                            if (expression_index >= expression.len) {
+                                return JsonPathError.InvalidLogicalExpression;
+                            }
+                            if (expression[expression_index] != '\'') {
+                                return JsonPathError.InvalidLogicalExpression;
+                            }
+                            expression_index += 1;
+                            logical_expressions.append(.{ .value = json.Value{ .integer = @intCast(string_buffer.items.len) } }) catch return JsonPathError.OutOfMemory;
+                        },
+                        else => return JsonPathError.InvalidLogicalExpression,
+                    }
+                } else if (std.mem.eql(u8, builtin_name_buffer.items, "count")) {
+                    // count()
+                    if (expression_index >= expression.len) {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    if (expression[expression_index] != '(') {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    expression_index += 1;
+                    // Must be an expression that evaluates to an array
+                    // Next char must be '@'
+                    if (expression_index >= expression.len) {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    if (expression[expression_index] != '@') {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    expression_index += 1;
+                    // Read the entire expression until we hit a closing ')' and evaluate it
+                    var expression_buffer = std.ArrayList(u8).init(allocator);
+                    while (expression_index < expression.len and (expression[expression_index] != ')')) {
+                        expression_buffer.append(expression[expression_index]) catch return JsonPathError.OutOfMemory;
+                        expression_index += 1;
+                    }
+                    if (expression_index >= expression.len) {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    if (expression[expression_index] != ')') {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    expression_index += 1;
+                    const evaluated_value = try evaluateJsonPath(allocator, expression_buffer.items, value, .{ .skip_root = true });
+                    if (evaluated_value == null) {
+                        return false;
+                    }
+                    const count = countBuiltin(&evaluated_value.?);
+                    if (count == null) {
+                        return false;
+                    }
+                    logical_expressions.append(.{ .value = count.? }) catch return JsonPathError.OutOfMemory;
                 }
             },
             else => return JsonPathError.InvalidPath,
@@ -1030,19 +1176,32 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, path: []u8, value: *const 
                         return json.Value{ .array = sliced_array };
                     },
                     .Expression => {
-                        // Can be Array or Object
-                        if (current_node.* != .array and current_node.* != .object) {
-                            return undefined;
-                        }
-                        // Evaluate the expression
+                        // Evaluate the expression (for either an array, or all of the child nodes of an object)
                         // Go through each item in the array and evaluate the expression
                         // If the expression is true for any item, then add it to the array
                         // Return the array
-                        for (current_node.array.items) |item| {
-                            const filter_match = try evaluateLogicalExpressionSelector(allocator, path[selector_expression_start_index + 1 .. selector_expression_end_index], &item);
-                            if (filter_match) {
-                                sliced_array.append(item) catch return JsonPathError.OutOfMemory;
-                            }
+                        switch (current_node.*) {
+                            .array => {
+                                for (current_node.array.items) |item| {
+                                    const filter_match = try evaluateLogicalExpressionSelector(allocator, path[selector_expression_start_index + 1 .. selector_expression_end_index], &item);
+                                    if (filter_match) {
+                                        sliced_array.append(item) catch return JsonPathError.OutOfMemory;
+                                    }
+                                }
+                            },
+                            .object => {
+                                // Loop through all of the child nodes and evaluate the expression\
+                                for (current_node.object.values()) |v| {
+                                    const filter_match = try evaluateLogicalExpressionSelector(allocator, path[selector_expression_start_index + 1 .. selector_expression_end_index], &v);
+                                    if (filter_match) {
+                                        sliced_array.append(v) catch return JsonPathError.OutOfMemory;
+                                    }
+                                }
+                            },
+                            else => {
+                                printErr("invalid path: expression selector must be used with an array or object\n", .{});
+                                return JsonPathError.InvalidPath;
+                            },
                         }
                         return json.Value{ .array = sliced_array };
                     },
@@ -1352,3 +1511,204 @@ test "wildcard select subpath in child object" {
     try testing.expectEqual(1, result.?.array.items.len);
     try testing.expectEqual(399, result.?.array.items[0].integer);
 }
+
+test "expression with length builtin" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, book_store_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.store[?length(@) == 4]");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(result.?.array.items.len, 1);
+    try testing.expectEqual(result.?.array.items[0].array.items.len, 4);
+}
+
+const rfc_example_json_23521 =
+    \\{
+    \\    "obj": {"x": "y"},
+    \\    "arr": [2, 3]
+    \\}
+;
+
+// TODO
+// $.absent1 == $.absent2 |  true  |    Empty nodelists
+// $.absent1 <= $.absent2 |  true  |     == implies <=      |
+//    $.absent == 'g'     | false  |     Empty nodelist     |
+// $.absent1 != $.absent2 | false  |    Empty nodelists     |
+//    $.absent != 'g'     |  true  |     Empty nodelist     |
+//         1 <= 2         |  true  |   Numeric comparison   |
+//         1 > 2          | false  |   Numeric comparison   |
+//       13 == '13'       | false  |     Type mismatch      |
+//       'a' <= 'b'       |  true  |   String comparison    |
+//       'a' > 'b'        | false  |   String comparison    |
+//     $.obj == $.arr     | false  |     Type mismatch      |
+//     $.obj != $.arr     |  true  |     Type mismatch      |
+//     $.obj == $.obj     |  true  |   Object comparison    |
+//     $.obj != $.obj     | false  |   Object comparison    |
+//     $.arr == $.arr     |  true  |    Array comparison    |
+//     $.arr != $.arr     | false  |    Array comparison    |
+//      $.obj == 17       | false  |     Type mismatch      |
+//      $.obj != 17       |  true  |     Type mismatch      |
+//     $.obj <= $.arr     | false  | Objects and arrays do  |
+//                        |        | not offer < comparison |
+//     $.obj < $.arr      | false  | Objects and arrays do  |
+//                        |        | not offer < comparison |
+//     $.obj <= $.obj     |  true  |     == implies <=      |
+//     $.arr <= $.arr     |  true  |     == implies <=      |
+//       1 <= $.arr       | false  | Arrays do not offer <  |
+//                        |        |       comparison       |
+//       1 >= $.arr       | false  | Arrays do not offer <  |
+//                        |        |       comparison       |
+//       1 > $.arr        | false  | Arrays do not offer <  |
+//                        |        |       comparison       |
+//       1 < $.arr        | false  | Arrays do not offer <  |
+//                        |        |       comparison       |
+//      true <= true      |  true  |     == implies <=      |
+//      true > true       | false  | Booleans do not offer  |
+//                        |        |      < comparison      |
+
+const rfc_example_json_23522 =
+    \\   {
+    \\    "a": [3, 5, 1, 2, 4, 6,
+    \\           {"b": "j"},
+    \\           {"b": "k"},
+    \\           {"b": {}},
+    \\           {"b": "kilo"}
+    \\          ],
+    \\    "o": {"p": 1, "q": 2, "r": 3, "s": 5, "t": {"u": 6}},
+    \\    "e": "f"
+    \\}
+;
+
+// +==================+==============+=============+===================+
+// |      Query       | Result       |    Result   | Comment           |
+// |                  |              |    Paths    |                   |
+// +==================+==============+=============+===================+
+// |   $.a[?@.b ==    | {"b":        |  $['a'][9]  | Member value      |
+// |     'kilo']      | "kilo"}      |             | comparison        |
+// +------------------+--------------+-------------+-------------------+
+test "$.a[?@.b == 'kilo']" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, rfc_example_json_23522, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.a[?@.b == 'kilo']");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(result.?.array.items.len, 1);
+    try testing.expectEqual(std.mem.eql(u8, result.?.array.items[0].object.get("b").?.string, "kilo"), true);
+}
+// TODO
+// |   $.a[?(@.b ==   | {"b":        |  $['a'][9]  | Equivalent query  |
+// |     'kilo')]     | "kilo"}      |             | with enclosing    |
+// |                  |              |             | parentheses       |
+// +------------------+--------------+-------------+-------------------+
+// |   $.a[?@>3.5]    | 5            |  $['a'][1]  | Array value       |
+// |                  | 4            |  $['a'][4]  | comparison        |
+// |                  | 6            |  $['a'][5]  |                   |
+// +------------------+--------------+-------------+-------------------+
+test "$.a[?@>3.5]" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, rfc_example_json_23522, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.a[?@>3.5]");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(3, result.?.array.items.len);
+    try testing.expectEqual(5, result.?.array.items[0].integer);
+    try testing.expectEqual(4, result.?.array.items[1].integer);
+    try testing.expectEqual(6, result.?.array.items[2].integer);
+}
+
+// TODO
+// |    $.a[?@.b]     | {"b": "j"}   |  $['a'][6]  | Array value       |
+// |                  | {"b": "k"}   |  $['a'][7]  | existence         |
+// |                  | {"b": {}}    |  $['a'][8]  |                   |
+// |                  | {"b":        |  $['a'][9]  |                   |
+// |                  | "kilo"}      |             |                   |
+// +------------------+--------------+-------------+-------------------+
+// |     $[?@.*]      | [3, 5, 1,    |    $['a']   | Existence of non- |
+// |                  | 2, 4, 6,     |    $['o']   | singular queries  |
+// |                  | {"b": "j"},  |             |                   |
+// |                  | {"b": "k"},  |             |                   |
+// |                  | {"b": {}},   |             |                   |
+// |                  | {"b":        |             |                   |
+// |                  | "kilo"}]     |             |                   |
+// |                  | {"p": 1,     |             |                   |
+// |                  | "q": 2,      |             |                   |
+// |                  | "r": 3,      |             |                   |
+// |                  | "s": 5,      |             |                   |
+// |                  | "t": {"u":   |             |                   |
+// |                  | 6}}          |             |                   |
+// +------------------+--------------+-------------+-------------------+
+// |   $[?@[?@.b]]    | [3, 5, 1,    |    $['a']   | Nested filters    |
+// |                  | 2, 4, 6,     |             |                   |
+// |                  | {"b": "j"},  |             |                   |
+// |                  | {"b": "k"},  |             |                   |
+// |                  | {"b": {}},   |             |                   |
+// |                  | {"b":        |             |                   |
+// |                  | "kilo"}]     |             |                   |
+// +------------------+--------------+-------------+-------------------+
+// | $.o[?@<3, ?@<3]  | 1            | $['o']['p'] | Non-deterministic |
+// |                  | 2            | $['o']['q'] | ordering          |
+// |                  | 2            | $['o']['q'] |                   |
+// |                  | 1            | $['o']['p'] |                   |
+// +------------------+--------------+-------------+-------------------+
+// | $.a[?@<2 || @.b  | 1            |  $['a'][2]  | Array value       |
+// |     == "k"]      | {"b": "k"}   |  $['a'][7]  | logical OR        |
+// +------------------+--------------+-------------+-------------------+
+test "$.a[?@<2 || @.b == 'k']" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, rfc_example_json_23522, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.a[?@<2 || @.b == 'k']");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(2, result.?.array.items.len);
+    try testing.expectEqual(1, result.?.array.items[0].integer);
+    try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[1].object.get("b").?.string, "k"));
+}
+
+// | $.a[?match(@.b,  | {"b": "j"}   |  $['a'][6]  | Array value       |
+// |     "[jk]")]     | {"b": "k"}   |  $['a'][7]  | regular           |
+// |                  |              |             | expression match  |
+// +------------------+--------------+-------------+-------------------+
+// | $.a[?search(@.b, | {"b": "j"}   |  $['a'][6]  | Array value       |
+// |     "[jk]")]     | {"b": "k"}   |  $['a'][7]  | regular           |
+// |                  | {"b":        |  $['a'][9]  | expression search |
+// |                  | "kilo"}      |             |                   |
+// +------------------+--------------+-------------+-------------------+
+// | $.o[?@>1 && @<4] | 2            | $['o']['q'] | Object value      |
+// |                  | 3            | $['o']['r'] | logical AND       |
+// +------------------+--------------+-------------+-------------------+
+// | $.o[?@>1 && @<4] | 3            | $['o']['r'] | Alternative       |
+// |                  | 2            | $['o']['q'] | result            |
+// +------------------+--------------+-------------+-------------------+
+// | $.o[?@.u || @.x] | {"u": 6}     | $['o']['t'] | Object value      |
+// |                  |              |             | logical OR        |
+// +------------------+--------------+-------------+-------------------+
+// | $.a[?@.b == $.x] | 3            |  $['a'][0]  | Comparison of     |
+// |                  | 5            |  $['a'][1]  | queries with no   |
+// |                  | 1            |  $['a'][2]  | values            |
+// |                  | 2            |  $['a'][3]  |                   |
+// |                  | 4            |  $['a'][4]  |                   |
+// |                  | 6            |  $['a'][5]  |                   |
+// +------------------+--------------+-------------+-------------------+
+// |   $.a[?@ == @]   | 3            |  $['a'][0]  | Comparisons of    |
+// |                  | 5            |  $['a'][1]  | primitive and of  |
+// |                  | 1            |  $['a'][2]  | structured values |
+// |                  | 2            |  $['a'][3]  |                   |
+// |                  | 4            |  $['a'][4]  |                   |
+// |                  | 6            |  $['a'][5]  |                   |
+// |                  | {"b": "j"}   |  $['a'][6]  |                   |
+// |                  | {"b": "k"}   |  $['a'][7]  |                   |
+// |                  | {"b": {}}    |  $['a'][8]  |                   |
+// |                  | {"b":        |  $['a'][9]  |                   |
+// |                  | "kilo"}      |             |                   |

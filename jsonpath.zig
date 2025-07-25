@@ -253,10 +253,116 @@ fn compareStringValues(left: []const u8, right: []const u8, operator: *Operator)
 fn compareBooleanValues(left: json.Value, right: json.Value, operator: *Operator) JsonPathError!bool {
     switch (operator.*) {
         .Equals => return left.bool == right.bool,
+        .GreaterThanOrEqualTo => return left.bool == right.bool,
+        .LessThanOrEqualTo => return left.bool == right.bool,
         .NotEquals => return left.bool != right.bool,
         .And => return left.bool and right.bool,
         .Or => return left.bool or right.bool,
         else => return false,
+    }
+}
+
+// Compare objects for equality/inequality only
+fn compareObjectValues(left: json.Value, right: json.Value, operator: *Operator) JsonPathError!bool {
+    switch (operator.*) {
+        // GreaterThanOrEqualTo and LessThanOrEqualTo are equivalent to Equals for objects
+        .Equals => {
+            // Objects are equal if they have the same keys and values
+            const left_obj = left.object;
+            const right_obj = right.object;
+
+            // First check if they have the same number of keys
+            if (left_obj.count() != right_obj.count()) {
+                return false;
+            }
+
+            // Check each key-value pair
+            var iterator = left_obj.iterator();
+            while (iterator.next()) |entry| {
+                const key = entry.key_ptr.*;
+                const left_value = entry.value_ptr.*;
+
+                // Check if the key exists in the right object
+                if (right_obj.get(key)) |right_value| {
+                    // Recursively compare values
+                    var left_val: ?json.Value = left_value;
+                    var right_val: ?json.Value = right_value;
+                    var equals_op = Operator.Equals;
+                    const values_equal = try compareTwoValues(&left_val, &right_val, &equals_op);
+                    if (!values_equal) {
+                        return false;
+                    }
+                } else {
+                    // Key doesn't exist in right object
+                    return false;
+                }
+            }
+            return true;
+        },
+        .GreaterThanOrEqualTo => {
+            var equals_op = Operator.Equals;
+            const are_equal = try compareObjectValues(left, right, &equals_op);
+            return are_equal;
+        },
+        .LessThanOrEqualTo => {
+            var equals_op = Operator.Equals;
+            const are_equal = try compareObjectValues(left, right, &equals_op);
+            return are_equal;
+        },
+        .NotEquals => {
+            var equals_op = Operator.Equals;
+            const are_equal = try compareObjectValues(left, right, &equals_op);
+            return !are_equal;
+        },
+        else => return false, // Objects don't support other comparison operators
+    }
+}
+
+// Compare arrays for equality/inequality only
+fn compareArrayValues(left: json.Value, right: json.Value, operator: *Operator) JsonPathError!bool {
+    switch (operator.*) {
+        // GreaterThanOrEqualTo and LessThanOrEqualTo are equivalent to Equals for arrays
+        .Equals => {
+            // Arrays are equal if they have the same length and elements
+            const left_arr = left.array;
+            const right_arr = right.array;
+
+            // First check if they have the same length
+            if (left_arr.items.len != right_arr.items.len) {
+                return false;
+            }
+
+            // Check each element
+            for (left_arr.items, 0..) |left_elem, i| {
+                const right_elem = right_arr.items[i];
+
+                // Recursively compare elements
+                var left_val: ?json.Value = left_elem;
+                var right_val: ?json.Value = right_elem;
+                var equals_op = Operator.Equals;
+                const elements_equal = try compareTwoValues(&left_val, &right_val, &equals_op);
+                if (!elements_equal) {
+                    return false;
+                }
+            }
+            return true;
+        },
+        .GreaterThanOrEqualTo => {
+            var equals_op = Operator.Equals;
+            const are_equal = try compareArrayValues(left, right, &equals_op);
+            return are_equal;
+        },
+        .LessThanOrEqualTo => {
+            var equals_op = Operator.Equals;
+            const are_equal = try compareArrayValues(left, right, &equals_op);
+            return are_equal;
+        },
+        .NotEquals => {
+            var equals_op = Operator.Equals;
+            const are_equal = try compareArrayValues(left, right, &equals_op);
+            return !are_equal;
+        },
+        else => return false, // Arrays don't support other comparison operators
     }
 }
 
@@ -275,20 +381,65 @@ fn compareTwoValues(left: *?json.Value, right: *?json.Value, operator: *Operator
             switch (right.*.?) {
                 .integer, .float => return compareNumericValues(left.*.?, right.*.?, operator),
                 else => {
-                    return false;
+                    // Cross-type comparison: different types
+                    switch (operator.*) {
+                        .Equals => return false,
+                        .NotEquals => return true,
+                        else => return false,
+                    }
                 },
             }
         },
         .bool => {
             switch (right.*.?) {
                 .bool => return compareBooleanValues(left.*.?, right.*.?, operator),
-                else => return false,
+                else => {
+                    // Cross-type comparison: different types
+                    switch (operator.*) {
+                        .Equals => return false,
+                        .NotEquals => return true,
+                        else => return false,
+                    }
+                },
             }
         },
         .string => {
             switch (right.*.?) {
                 .string => return compareStringValues(left.*.?.string, right.*.?.string, operator),
-                else => return false,
+                else => {
+                    // Cross-type comparison: different types
+                    switch (operator.*) {
+                        .Equals => return false,
+                        .NotEquals => return true,
+                        else => return false,
+                    }
+                },
+            }
+        },
+        .object => {
+            switch (right.*.?) {
+                .object => return compareObjectValues(left.*.?, right.*.?, operator),
+                else => {
+                    // Cross-type comparison: different types
+                    switch (operator.*) {
+                        .Equals => return false,
+                        .NotEquals => return true,
+                        else => return false,
+                    }
+                },
+            }
+        },
+        .array => {
+            switch (right.*.?) {
+                .array => return compareArrayValues(left.*.?, right.*.?, operator),
+                else => {
+                    // Cross-type comparison: different types
+                    switch (operator.*) {
+                        .Equals => return false,
+                        .NotEquals => return true,
+                        else => return false,
+                    }
+                },
             }
         },
         else => return false,
@@ -365,7 +516,7 @@ fn evaluateLogicalExpression(expression: []LogicalExpressionComponent) JsonPathE
                 // Can only be And/Or if we already have a final result
                 switch (expression[index].operator) {
                     .And, .Or => {
-                        if (final_result == undefined) {
+                        if (final_result == null) {
                             printErr("invalid logical expression: and/or operator must be preceded by a boolean or a value comparison\n", .{});
                             return JsonPathError.InvalidPath;
                         }
@@ -384,7 +535,7 @@ fn evaluateLogicalExpression(expression: []LogicalExpressionComponent) JsonPathE
         }
         index += 1;
     }
-    if (final_result == undefined) {
+    if (final_result == null) {
         printErr("invalid logical expression: indeterminate result\n", .{});
         return JsonPathError.InvalidPath;
     }
@@ -1759,6 +1910,59 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, expression: []u8, root_jso
     while (path_index < expression.len) {
         char = expression[path_index];
         switch (char) {
+            't' => {
+                // True literal, must be followed by 'r' and 'u' and 'e'
+                path_index += 1;
+                if (path_index >= expression.len) {
+                    printErr("invalid boolean literal: missing closing 't'\n", .{});
+                    return JsonPathError.InvalidPath;
+                }
+                if (expression[path_index] != 'r') {
+                    printErr("invalid boolean literal: missing closing 'r'\n", .{});
+                    return JsonPathError.InvalidPath;
+                }
+                path_index += 1;
+                if (expression[path_index] != 'u') {
+                    printErr("invalid boolean literal: missing closing 'u'\n", .{});
+                    return JsonPathError.InvalidPath;
+                }
+                path_index += 1;
+                if (expression[path_index] != 'e') {
+                    printErr("invalid boolean literal: missing closing 'e'\n", .{});
+                    return JsonPathError.InvalidPath;
+                }
+                path_index += 1;
+                logical_expressions.append(LogicalExpressionComponent{ .value = json.Value{ .bool = true } }) catch return JsonPathError.OutOfMemory;
+            },
+            'f' => {
+                // False literal, must be followed by 'a' and 'l' and 's' and 'e'
+                path_index += 1;
+                if (path_index >= expression.len) {
+                    printErr("invalid boolean literal: missing closing 'f'\n", .{});
+                    return JsonPathError.InvalidPath;
+                }
+                if (expression[path_index] != 'a') {
+                    printErr("invalid boolean literal: missing closing 'a'\n", .{});
+                    return JsonPathError.InvalidPath;
+                }
+                path_index += 1;
+                if (expression[path_index] != 'l') {
+                    printErr("invalid boolean literal: missing closing 'l'\n", .{});
+                    return JsonPathError.InvalidPath;
+                }
+                path_index += 1;
+                if (expression[path_index] != 's') {
+                    printErr("invalid boolean literal: missing closing 's'\n", .{});
+                    return JsonPathError.InvalidPath;
+                }
+                path_index += 1;
+                if (expression[path_index] != 'e') {
+                    printErr("invalid boolean literal: missing closing 'e'\n", .{});
+                    return JsonPathError.InvalidPath;
+                }
+                path_index += 1;
+                logical_expressions.append(LogicalExpressionComponent{ .value = json.Value{ .bool = false } }) catch return JsonPathError.OutOfMemory;
+            },
             '$' => {
                 // Evaluating a JSON path expression - increment path index until we hit a comparison operator
                 expression_index = path_index;
@@ -1772,7 +1976,9 @@ pub fn evaluateJsonPath(allocator: std.mem.Allocator, expression: []u8, root_jso
                     char = expression[path_index];
                 }
                 // Evaluate the rest of the expression
-                const result = try evaluateJsonPathExpression(allocator, expression[expression_index..path_index], root_json, .{});
+                const trimmed_path = std.mem.trim(u8, expression[expression_index..path_index], " \t\n\r");
+                const path_expr = try allocator.dupe(u8, trimmed_path);
+                const result = try evaluateJsonPathExpression(allocator, path_expr, root_json, .{});
                 logical_expressions.append(LogicalExpressionComponent{ .value = result }) catch return JsonPathError.OutOfMemory;
             },
             '!' => {
@@ -1984,17 +2190,17 @@ test "$.absent1 == $.absent2" {
     try testing.expectEqual(result.bool, true);
 }
 
-// test "$.absent1 <= $.absent2" {
-//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-//     defer arena.deinit();
-//     const alloc = arena.allocator();
-//     var root_json: json.Value = undefined;
-//     root_json = try json.parseFromSliceLeaky(json.Value, alloc, rfc_example_json_23522, .{});
-//     var path = std.ArrayList(u8).init(alloc);
-//     try path.appendSlice("$.absent1 <= $.absent2");
-//     const result = try evaluateJsonPath(alloc, path.items, &root_json);
-//     try testing.expectEqual(result.bool, false);
-// }
+test "$.absent1 <= $.absent2" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, rfc_example_json_23522, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.absent1 <= $.absent2");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(result.bool, false);
+}
 
 test "$.absent == 'g'" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2029,7 +2235,7 @@ test "$.absent != 'g'" {
     var path = std.ArrayList(u8).init(alloc);
     try path.appendSlice("$.absent != 'g'");
     const result = try evaluateJsonPath(alloc, path.items, &root_json);
-    try testing.expectEqual(result.bool, true);
+    try testing.expectEqual(true, result.bool);
 }
 
 test "1 <= 2" {
@@ -2089,7 +2295,7 @@ test "13 == '13'" {
     var path = std.ArrayList(u8).init(alloc);
     try path.appendSlice("13 == '13'");
     const result = try evaluateJsonPath(alloc, path.items, &root_json);
-    try testing.expectEqual(result.bool, false);
+    try testing.expectEqual(false, result.bool);
 }
 
 test "'a' > 'b'" {
@@ -2101,7 +2307,7 @@ test "'a' > 'b'" {
     var path = std.ArrayList(u8).init(alloc);
     try path.appendSlice("'a' > 'b'");
     const result = try evaluateJsonPath(alloc, path.items, &root_json);
-    try testing.expectEqual(result.bool, false);
+    try testing.expectEqual(false, result.bool);
 }
 
 test "$.obj == $.arr" {
@@ -2113,7 +2319,7 @@ test "$.obj == $.arr" {
     var path = std.ArrayList(u8).init(alloc);
     try path.appendSlice("$.obj == $.arr");
     const result = try evaluateJsonPath(alloc, path.items, &root_json);
-    try testing.expectEqual(result.bool, false);
+    try testing.expectEqual(false, result.bool);
 }
 
 test "$.obj != $.arr" {
@@ -2125,56 +2331,55 @@ test "$.obj != $.arr" {
     var path = std.ArrayList(u8).init(alloc);
     try path.appendSlice("$.obj != $.arr");
     const result = try evaluateJsonPath(alloc, path.items, &root_json);
-    try testing.expectEqual(result.bool, true);
+    try testing.expectEqual(true, result.bool);
 }
 
-//test "$.obj == $.obj" {
-//    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-//    defer arena.deinit();
-//    const alloc = arena.allocator();
-//    var root_json: json.Value = undefined;
-//    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
-//    var path = std.ArrayList(u8).init(alloc);
-//    try path.appendSlice("$.obj == $.obj");
-//    const result = try evaluateJsonPath(alloc, path.items, &root_json);
-//    try testing.expectEqual(result.bool, true);
-//}
+test "$.obj == $.obj" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.obj == $.obj");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(true, result.bool);
+}
+test "$.obj != $.obj" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.obj != $.obj");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(false, result.bool);
+}
 
-// test "$.obj != $.obj" {
-//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-//     defer arena.deinit();
-//     const alloc = arena.allocator();
-//     var root_json: json.Value = undefined;
-//     root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
-//     var path = std.ArrayList(u8).init(alloc);
-//     try path.appendSlice("$.obj != $.obj");
-//     const result = try evaluateJsonPath(alloc, path.items, &root_json);
-//     try testing.expectEqual(result.bool, false);
-// }
+test "$.arr == $.arr" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.arr == $.arr");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(true, result.bool);
+}
 
-// test "$.arr == $.arr" {
-//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-//     defer arena.deinit();
-//     const alloc = arena.allocator();
-//     var root_json: json.Value = undefined;
-//     root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
-//     var path = std.ArrayList(u8).init(alloc);
-//     try path.appendSlice("$.arr == $.arr");
-//     const result = try evaluateJsonPath(alloc, path.items, &root_json);
-//     try testing.expectEqual(result.bool, true);
-// }
-
-// test "$.arr != $.arr" {
-//     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-//     defer arena.deinit();
-//     const alloc = arena.allocator();
-//     var root_json: json.Value = undefined;
-//     root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
-//     var path = std.ArrayList(u8).init(alloc);
-//     try path.appendSlice("$.arr != $.arr");
-//     const result = try evaluateJsonPath(alloc, path.items, &root_json);
-//     try testing.expectEqual(result.bool, false);
-// }
+test "$.arr != $.arr" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.arr != $.arr");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(false, result.bool);
+}
 
 test "$.obj == 17" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -2185,5 +2390,113 @@ test "$.obj == 17" {
     var path = std.ArrayList(u8).init(alloc);
     try path.appendSlice("$.obj == 17");
     const result = try evaluateJsonPath(alloc, path.items, &root_json);
-    try testing.expectEqual(result.bool, false);
+    try testing.expectEqual(false, result.bool);
+}
+
+test "$.obj != 17" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.obj != 17");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(true, result.bool);
+}
+
+test "$.obj <= $.arr" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.obj2.floats[0] == 1.1");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(true, result.bool);
+}
+
+test "$.obj < $.arr" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.obj < $.arr");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(false, result.bool);
+}
+
+test "$.obj <= $.obj" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.obj <= $.obj");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(true, result.bool);
+}
+
+test "$.arr <= $.arr" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.arr <= $.arr");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(true, result.bool);
+}
+
+test "1 <= $.arr" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("1 <= $.arr");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(false, result.bool);
+}
+
+test "1 < $.arr" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("1 < $.arr");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(false, result.bool);
+}
+
+test "true <= true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("true <= true");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(true, result.bool);
+}
+
+test "true > true" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, example_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("true > true");
+    const result = try evaluateJsonPath(alloc, path.items, &root_json);
+    try testing.expectEqual(false, result.bool);
 }

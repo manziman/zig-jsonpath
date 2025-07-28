@@ -11,7 +11,7 @@ A Zig JSONPath library that implements the IETF RFC 9535.
 - [x] length() builtin function
 - [ ] match() builtin function
 - [ ] search() builtin function
-- [ ] value() builtin function
+- [x] value() builtin function
 - [ ] Regular expression pattern matching
 ### Misc
 - [x] Release automation

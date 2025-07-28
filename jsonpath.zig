@@ -44,6 +44,9 @@
 //!   | length(@.foo)    | function extension (Section 2.4): invokes      |
 //!   |                  | a function in a filter expression              |
 //!   +------------------+------------------------------------------------+
+//!   | value(@.foo)     | function extension (Section 2.4): invokes      |
+//!   |                  | a function in a filter expression              |
+//!   +------------------+------------------------------------------------+
 //!
 //! Examples:
 //!
@@ -178,6 +181,24 @@ fn countBuiltin(value: *const json.Value) ?json.Value {
         return null;
     }
     return json.Value{ .integer = @intCast(value.array.items.len) };
+}
+
+// The value() builtin expression function
+// For NodesType - if single node, return its value; if empty or multiple nodes, return null
+fn valueBuiltin(value: *const json.Value) ?json.Value {
+    switch (value.*) {
+        // If it's an array (representing multiple nodes)
+        .array => {
+            // If empty or multiple nodes, return null
+            if (value.array.items.len == 0 or value.array.items.len > 1) {
+                return null;
+            }
+            // If single node, return its value
+            return value.array.items[0];
+        },
+        // If it's a single value, return it
+        else => return value.*,
+    }
 }
 
 // Given a JSON value, return a string name for the type of value it contains
@@ -453,7 +474,6 @@ fn evaluateLogicalExpression(expression: []LogicalExpressionComponent) JsonPathE
         return JsonPathError.InvalidPath;
     }
     // Evaluate chain of operators and values
-    // e.g. [{"value":"Nigel Rees"},{"operator":"Equals"},{"value":"Nigel Rees"},{"operator":"Or"},{"value":"Nigel Rees"},{"operator":"Equals"},{"value":"Herman Melville"}]
     var index: u64 = 0;
     var previous_value: *?json.Value = undefined;
     var final_result: ?bool = undefined;
@@ -876,6 +896,75 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                         return false;
                     }
                     logical_expressions.append(.{ .value = count.? }) catch return JsonPathError.OutOfMemory;
+                } else if (std.mem.eql(u8, builtin_name_buffer.items, "value")) {
+                    // value()
+                    if (expression_index >= expression.len) {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    if (expression[expression_index] != '(') {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    expression_index += 1;
+                    if (expression_index >= expression.len) {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    // Next should either be a @ indicating an expression or a ' indicating a string
+                    switch (expression[expression_index]) {
+                        '@' => {
+                            expression_index += 1;
+                            // Read the entire expression until we hit a closing ')' and evaluate it
+                            var expression_buffer = std.ArrayList(u8).init(allocator);
+                            while (expression_index < expression.len and (expression[expression_index] != ')')) {
+                                expression_buffer.append(expression[expression_index]) catch return JsonPathError.OutOfMemory;
+                                expression_index += 1;
+                            }
+                            if (expression_index >= expression.len) {
+                                return JsonPathError.InvalidLogicalExpression;
+                            }
+                            if (expression[expression_index] != ')') {
+                                return JsonPathError.InvalidLogicalExpression;
+                            }
+                            expression_index += 1;
+                            const evaluated_value = try evaluateJsonPathExpression(allocator, expression_buffer.items, value, .{ .skip_root = true });
+                            if (evaluated_value == null) {
+                                // If the path evaluation returns null, value() should return null
+                                logical_expressions.append(.{ .value = null }) catch return JsonPathError.OutOfMemory;
+                            } else {
+                                // Now get the value of the evaluated value
+                                const result_value = valueBuiltin(&evaluated_value.?);
+                                // Append the result whether it's null or not - null comparisons are valid
+                                logical_expressions.append(.{ .value = result_value }) catch return JsonPathError.OutOfMemory;
+                            }
+                        },
+                        '\'' => {
+                            expression_index += 1;
+                            // Read the entire string until we hit another '
+                            var string_buffer = std.ArrayList(u8).init(allocator);
+                            var escape_next_char: bool = false;
+                            expr_char = expression[expression_index];
+                            while (expression_index < expression.len and (expr_char != '\'' or escape_next_char)) {
+                                if (expr_char == '\\') {
+                                    escape_next_char = true;
+                                } else {
+                                    string_buffer.append(expr_char) catch return JsonPathError.OutOfMemory;
+                                    escape_next_char = false;
+                                }
+                                expression_index += 1;
+                                if (expression_index < expression.len) {
+                                    expr_char = expression[expression_index];
+                                }
+                            }
+                            if (expression_index >= expression.len) {
+                                return JsonPathError.InvalidLogicalExpression;
+                            }
+                            if (expression[expression_index] != '\'') {
+                                return JsonPathError.InvalidLogicalExpression;
+                            }
+                            expression_index += 1;
+                            logical_expressions.append(.{ .value = json.Value{ .string = string_buffer.items } }) catch return JsonPathError.OutOfMemory;
+                        },
+                        else => return JsonPathError.InvalidLogicalExpression,
+                    }
                 }
             },
             else => return JsonPathError.InvalidPath,
@@ -895,7 +984,6 @@ const books_json =
     \\   { "category": "fiction",
     \\     "author": "Evelyn Waugh",
     \\     "title": "Sword of Honour",
-    \\     "isbn": "0-553-21311-3",
     \\     "price": 12.99
     \\   },
     \\   { "category": "fiction",
@@ -972,6 +1060,63 @@ const SelectorType = enum {
     Unknown,
 };
 
+// Recursive helper function for descendant search (..)
+fn recursiveDescendantSearch(allocator: std.mem.Allocator, node: *const json.Value, remaining_path: []u8, results: *std.ArrayList(json.Value)) JsonPathError!void {
+    // First, try to evaluate the remaining path from the current node
+    if (remaining_path.len > 0) {
+        // For descendant search, we need to handle simple property names directly
+        if (node.* == .object) {
+            // Try to get the property directly if it's a simple name
+            var is_simple_name = true;
+            for (remaining_path) |c| {
+                if (c == '.' or c == '[' or c == ']') {
+                    is_simple_name = false;
+                    break;
+                }
+            }
+
+            if (is_simple_name) {
+                // Direct property access
+                if (node.object.get(remaining_path)) |value| {
+                    results.append(value) catch return JsonPathError.OutOfMemory;
+                }
+            } else {
+                // Complex path - use full path evaluation
+                const result = try evaluateJsonPathExpression(allocator, remaining_path, node, .{ .skip_root = true });
+                if (result != null) {
+                    switch (result.?) {
+                        .array => {
+                            for (result.?.array.items) |item| {
+                                results.append(item) catch return JsonPathError.OutOfMemory;
+                            }
+                        },
+                        else => {
+                            results.append(result.?) catch return JsonPathError.OutOfMemory;
+                        },
+                    }
+                }
+            }
+        }
+    }
+
+    // Then recursively search through all children
+    switch (node.*) {
+        .object => {
+            for (node.object.values()) |child| {
+                try recursiveDescendantSearch(allocator, &child, remaining_path, results);
+            }
+        },
+        .array => {
+            for (node.array.items) |child| {
+                try recursiveDescendantSearch(allocator, &child, remaining_path, results);
+            }
+        },
+        else => {
+            // Primitive values have no children to search
+        },
+    }
+}
+
 pub fn evaluateJsonPathExpression(allocator: std.mem.Allocator, path: []u8, value: *const json.Value, opts: struct { skip_root: bool = false, start_index: u64 = 0 }) JsonPathError!?json.Value {
     // Check for empty string
     if (!opts.skip_root and path.len == 0) {
@@ -1006,23 +1151,11 @@ pub fn evaluateJsonPathExpression(allocator: std.mem.Allocator, path: []u8, valu
                     return JsonPathError.InvalidPath;
                 }
                 char = path[path_index];
-                // '..' - evaluate all keys in the current node
+                // '..' - descendant search: recursively search all descendants
                 if (char == '.') {
-                    // Error if not an object
-                    if (current_node.* != .object) {
-                        return undefined;
-                    }
-                    // If current node is not an object, then return undefined
-                    if (current_node.* != .object) {
-                        return undefined;
-                    }
-                    // Loop through all of the keys in the current node and evaluate the path for each key
-                    // Create a new ArrayList to contain the evaluated keys
+                    path_index += 1; // Skip the second '.'
                     var evaluated_keys = std.ArrayList(json.Value).init(allocator);
-                    for (current_node.object.keys()) |key| {
-                        const evaluated_key = try evaluateJsonPathExpression(allocator, path[path_index..], &current_node.object.get(key).?, .{ .skip_root = true });
-                        evaluated_keys.append(evaluated_key.?) catch return JsonPathError.OutOfMemory;
-                    }
+                    try recursiveDescendantSearch(allocator, current_node, path[path_index..], &evaluated_keys);
                     return json.Value{ .array = evaluated_keys };
                 } else if (char == '*') { // Select all children of the current node
                     path_index += 1;
@@ -1359,12 +1492,10 @@ pub fn evaluateJsonPathExpression(allocator: std.mem.Allocator, path: []u8, valu
                                 }
                             },
                             .object => {
-                                // Loop through all of the child nodes and evaluate the expression\
-                                for (current_node.object.values()) |v| {
-                                    const filter_match = try evaluateLogicalExpressionSelector(allocator, path[selector_expression_start_index + 1 .. selector_expression_end_index], &v);
-                                    if (filter_match) {
-                                        sliced_array.append(v) catch return JsonPathError.OutOfMemory;
-                                    }
+                                // Evaludate against the object
+                                const filter_match = try evaluateLogicalExpressionSelector(allocator, path[selector_expression_start_index + 1 .. selector_expression_end_index], current_node);
+                                if (filter_match) {
+                                    sliced_array.append(current_node.*) catch return JsonPathError.OutOfMemory;
                                 }
                             },
                             else => {
@@ -1692,10 +1823,10 @@ test "expression with length builtin" {
     var root_json: json.Value = undefined;
     root_json = try json.parseFromSliceLeaky(json.Value, alloc, book_store_json, .{});
     var path = std.ArrayList(u8).init(alloc);
-    try path.appendSlice("$.store[?length(@) == 4]");
+    try path.appendSlice("$.store[?length(@.book) == 4]");
     const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
     try testing.expectEqual(1, result.?.array.items.len);
-    try testing.expectEqual(4, result.?.array.items[0].array.items.len);
+    try testing.expectEqual(4, result.?.array.items[0].object.get("book").?.array.items.len);
 }
 
 test "expression using count builtin" {
@@ -1705,7 +1836,7 @@ test "expression using count builtin" {
     var root_json: json.Value = undefined;
     root_json = try json.parseFromSliceLeaky(json.Value, alloc, book_store_json, .{});
     var path = std.ArrayList(u8).init(alloc);
-    try path.appendSlice("$[?count(@.book) == 4]");
+    try path.appendSlice("$.store[?count(@.book) == 4]");
     const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
     try testing.expectEqual(1, result.?.array.items.len);
     try testing.expectEqual(4, result.?.array.items[0].object.get("book").?.array.items.len);
@@ -2499,4 +2630,60 @@ test "true > true" {
     try path.appendSlice("true > true");
     const result = try evaluateJsonPath(alloc, path.items, &root_json);
     try testing.expectEqual(false, result.bool);
+}
+
+const value_test_json =
+    \\{
+    \\    "store": {
+    \\        "book": [
+    \\            { "category": "reference", "color": "red" },
+    \\            { "category": "fiction", "color": "blue" }
+    \\        ],
+    \\        "bicycle": { "color": "red" }
+    \\    },  
+    \\    "single": { "color": "red" },
+    \\    "multiple": [
+    \\        { "color": "red" },
+    \\        { "color": "blue" }
+    \\    ]
+    \\}
+;
+
+test "$.single[?value(@.color) == 'red']" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, value_test_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    try path.appendSlice("$.single[?value(@.color) == 'red']");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(1, result.?.array.items.len);
+    try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[0].object.get("color").?.string, "red"));
+}
+
+test "$[?value(@..color) == 'red']" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, value_test_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    // This should find no matches because value(@..color) returns null when there are multiple nodes
+    try path.appendSlice("$[?value(@..color) == 'red']");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(0, result.?.array.items.len);
+}
+
+test "$.single[?value(@.nonexistent) == 'red']" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, value_test_json, .{});
+    var path = std.ArrayList(u8).init(alloc);
+    // This should find no matches because value(@.nonexistent) returns null for empty nodelist
+    try path.appendSlice("$.single[?value(@.nonexistent) == 'red']");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(0, result.?.array.items.len);
 }

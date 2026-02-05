@@ -15,7 +15,7 @@
     // This field is optional.
     // This is currently advisory only; Zig does not yet do anything
     // with this value.
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.15.1",
 
     .fingerprint = 0xc39891c8d8368dd,
 
@@ -24,7 +24,12 @@
     // `zig build --fetch` can be used to fetch all dependencies of a package, recursively.
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
-    .dependencies = .{},
+    .dependencies = .{
+        .mvzr = .{
+            .url = "git+https://github.com/mnemnion/mvzr#17a44b46cfe48ef46818d51bdf1161783dfe66e1",
+            .hash = "mvzr-0.3.7-ZSOky5FtAQB2VrFQPNbXHQCFJxWTMAYEK7ljYEaMR6jt",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

@@ -124,11 +124,15 @@
 //! The '.' case is straightforward. We read the key, and then continue evaluation from the next part of the path.
 //! If we hit '.' again, then we will evaluate all keys in the current node in the same way that we would handle a selector expression
 const std = @import("std");
-const zbench = @import("zbench");
+const mvzr = @import("mvzr");
 const json = std.json;
 const printErr = std.log.err;
 //const printWarn = std.log.warn;
 const testing = std.testing;
+
+pub const std_options: std.Options = .{
+    .log_level = if (@import("builtin").is_test) .debug else std.log.default_level,
+};
 
 // Extend this type with the OutOfMemory error from std.mem
 pub const JsonPathError = error{
@@ -199,6 +203,34 @@ fn valueBuiltin(value: *const json.Value) ?json.Value {
         // If it's a single value, return it
         else => return value.*,
     }
+}
+
+// The search() builtin expression function (RFC 9535 Section 2.4.7)
+// Checks whether a given string contains a substring that matches a given regular expression.
+// Parameters:
+//   - haystack: ValueType (string) - the string to search in
+//   - pattern: ValueType (string) - the regular expression pattern
+// Result: LogicalType - true if at least one substring matches, false otherwise
+// If the first argument is not a string or the second is not a valid regex pattern,
+// the result is LogicalFalse (represented as json.Value{ .bool = false }).
+fn searchBuiltin(haystack: []const u8, pattern: []const u8) json.Value {
+    // Compile the regex pattern using mvzr
+    const regex = mvzr.compile(pattern);
+    if (regex == null) {
+        // Invalid regex pattern - return false
+        return json.Value{ .bool = false };
+    }
+
+    // Search for the pattern in the haystack
+    // mvzr's match function finds the first match in the string
+    const match_result = regex.?.match(haystack);
+    if (match_result != null) {
+        // Found a match - return true
+        return json.Value{ .bool = true };
+    }
+
+    // No match found - return false
+    return json.Value{ .bool = false };
 }
 
 // Given a JSON value, return a string name for the type of value it contains
@@ -476,7 +508,7 @@ fn evaluateLogicalExpression(expression: []LogicalExpressionComponent) JsonPathE
     // Evaluate chain of operators and values
     var index: u64 = 0;
     var previous_value: *?json.Value = undefined;
-    var final_result: ?bool = undefined;
+    var final_result: ?bool = null;
     var operator: Operator = .Unset;
     var and_or_operator: Operator = .Unset;
     var evaluating_chunk: bool = false;
@@ -509,6 +541,10 @@ fn evaluateLogicalExpression(expression: []LogicalExpressionComponent) JsonPathE
                         evaluating_chunk = true;
                     },
                     else => {
+                        if (!evaluating_chunk) {
+                            printErr("invalid logical expression: comparison operator must follow a value\n", .{});
+                            return JsonPathError.InvalidLogicalExpression;
+                        }
                         const new_result = try compareTwoValues(previous_value, &expression[index].value, &operator);
                         // If we have an And/Or operator, then we need to compare our new result with the previous result
                         if (and_or_operator != .Unset) {
@@ -536,6 +572,13 @@ fn evaluateLogicalExpression(expression: []LogicalExpressionComponent) JsonPathE
                 // Can only be And/Or if we already have a final result
                 switch (expression[index].operator) {
                     .And, .Or => {
+                        // If we have a pending boolean value from a grouped expression, use it as the final result
+                        if (final_result == null and evaluating_chunk) {
+                            if (previous_value.* != null and previous_value.*.? == .bool) {
+                                final_result = previous_value.*.?.bool;
+                                evaluating_chunk = false;
+                            }
+                        }
                         if (final_result == null) {
                             printErr("invalid logical expression: and/or operator must be preceded by a boolean or a value comparison\n", .{});
                             return JsonPathError.InvalidPath;
@@ -554,6 +597,22 @@ fn evaluateLogicalExpression(expression: []LogicalExpressionComponent) JsonPathE
             },
         }
         index += 1;
+    }
+    // If we finished with a single boolean value that wasn't compared to anything,
+    // use that as the final result (e.g., from search() or match() functions)
+    if (evaluating_chunk and previous_value.* != null and previous_value.*.? == .bool) {
+        const pending_bool = previous_value.*.?.bool;
+        if (final_result == null) {
+            // No previous result, just use this boolean
+            return pending_bool;
+        } else if (and_or_operator != .Unset) {
+            // We have a previous result and an And/Or operator waiting
+            return switch (and_or_operator) {
+                .And => final_result.? and pending_bool,
+                .Or => final_result.? or pending_bool,
+                else => final_result.?,
+            };
+        }
     }
     if (final_result == null) {
         printErr("invalid logical expression: indeterminate result\n", .{});
@@ -965,13 +1024,152 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                         },
                         else => return JsonPathError.InvalidLogicalExpression,
                     }
+                } else if (std.mem.eql(u8, builtin_name_buffer.items, "search")) {
+                    // search(haystack, pattern) - RFC 9535 Section 2.4.7
+                    // Checks whether a given string contains a substring that matches a regex
+                    if (expression_index >= expression.len) {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    if (expression[expression_index] != '(') {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    expression_index += 1;
+                    if (expression_index >= expression.len) {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+
+                    // First argument: the string to search in (either @.field or 'string')
+                    var haystack_value: ?[]const u8 = null;
+                    switch (expression[expression_index]) {
+                        '@' => {
+                            expression_index += 1;
+                            // Read the expression until we hit a comma
+                            var expression_buffer = std.array_list.Managed(u8).init(allocator);
+                            while (expression_index < expression.len and expression[expression_index] != ',') {
+                                expression_buffer.append(expression[expression_index]) catch return JsonPathError.OutOfMemory;
+                                expression_index += 1;
+                            }
+                            if (expression_index >= expression.len or expression[expression_index] != ',') {
+                                return JsonPathError.InvalidLogicalExpression;
+                            }
+                            const evaluated_value = try evaluateJsonPathExpression(allocator, expression_buffer.items, value, .{ .skip_root = true });
+                            if (evaluated_value == null) {
+                                // If the path evaluation returns null, search returns false
+                                logical_expressions.append(.{ .value = json.Value{ .bool = false } }) catch return JsonPathError.OutOfMemory;
+                                // Skip to the closing parenthesis
+                                while (expression_index < expression.len and expression[expression_index] != ')') {
+                                    expression_index += 1;
+                                }
+                                expression_index += 1;
+                                continue :ex;
+                            }
+                            // Extract the actual value (may be wrapped in an array)
+                            const actual_value = valueBuiltin(&evaluated_value.?);
+                            if (actual_value == null) {
+                                // If no single value (empty or multiple results), search returns false
+                                logical_expressions.append(.{ .value = json.Value{ .bool = false } }) catch return JsonPathError.OutOfMemory;
+                                // Skip to the closing parenthesis
+                                while (expression_index < expression.len and expression[expression_index] != ')') {
+                                    expression_index += 1;
+                                }
+                                expression_index += 1;
+                                continue :ex;
+                            }
+                            // The extracted value should be a string
+                            if (actual_value.? != .string) {
+                                // If not a string, search returns false
+                                logical_expressions.append(.{ .value = json.Value{ .bool = false } }) catch return JsonPathError.OutOfMemory;
+                                // Skip to the closing parenthesis
+                                while (expression_index < expression.len and expression[expression_index] != ')') {
+                                    expression_index += 1;
+                                }
+                                expression_index += 1;
+                                continue :ex;
+                            }
+                            haystack_value = actual_value.?.string;
+                        },
+                        '\'' => {
+                            expression_index += 1;
+                            // Read the string until we hit another '
+                            var string_buffer = std.array_list.Managed(u8).init(allocator);
+                            var escape_next_char: bool = false;
+                            expr_char = expression[expression_index];
+                            while (expression_index < expression.len and (expr_char != '\'' or escape_next_char)) {
+                                if (expr_char == '\\') {
+                                    escape_next_char = true;
+                                } else {
+                                    string_buffer.append(expr_char) catch return JsonPathError.OutOfMemory;
+                                    escape_next_char = false;
+                                }
+                                expression_index += 1;
+                                if (expression_index < expression.len) {
+                                    expr_char = expression[expression_index];
+                                }
+                            }
+                            if (expression_index >= expression.len or expression[expression_index] != '\'') {
+                                return JsonPathError.InvalidLogicalExpression;
+                            }
+                            expression_index += 1;
+                            haystack_value = string_buffer.items;
+                        },
+                        else => return JsonPathError.InvalidLogicalExpression,
+                    }
+
+                    // Skip whitespace and comma between arguments
+                    while (expression_index < expression.len and (expression[expression_index] == ' ' or expression[expression_index] == ',')) {
+                        expression_index += 1;
+                    }
+                    if (expression_index >= expression.len) {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+
+                    // Second argument: the regex pattern (must be a string literal)
+                    if (expression[expression_index] != '\'') {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    expression_index += 1;
+                    var pattern_buffer = std.array_list.Managed(u8).init(allocator);
+                    var escape_next_char: bool = false;
+                    expr_char = expression[expression_index];
+                    while (expression_index < expression.len and (expr_char != '\'' or escape_next_char)) {
+                        if (expr_char == '\\') {
+                            escape_next_char = true;
+                        } else {
+                            pattern_buffer.append(expr_char) catch return JsonPathError.OutOfMemory;
+                            escape_next_char = false;
+                        }
+                        expression_index += 1;
+                        if (expression_index < expression.len) {
+                            expr_char = expression[expression_index];
+                        }
+                    }
+                    if (expression_index >= expression.len or expression[expression_index] != '\'') {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    expression_index += 1;
+
+                    // Skip whitespace before closing parenthesis
+                    while (expression_index < expression.len and expression[expression_index] == ' ') {
+                        expression_index += 1;
+                    }
+                    if (expression_index >= expression.len or expression[expression_index] != ')') {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+                    expression_index += 1;
+
+                    // Call the searchBuiltin function
+                    const search_result = searchBuiltin(haystack_value.?, pattern_buffer.items);
+                    logical_expressions.append(.{ .value = search_result }) catch return JsonPathError.OutOfMemory;
+                } else {
+                    return JsonPathError.BuiltinNotFound;
                 }
             },
             else => return JsonPathError.InvalidPath,
         }
     }
     // Evaluate the logical expressions
-    return try evaluateLogicalExpression(logical_expressions.items);
+    const final_result = try evaluateLogicalExpression(logical_expressions.items);
+    return final_result;
 }
 
 const books_json =
@@ -1190,7 +1388,7 @@ pub fn evaluateJsonPathExpression(allocator: std.mem.Allocator, path: []u8, valu
                 }
                 // Error if not an object
                 if (current_node.* != .object) {
-                    return undefined;
+                    return null;
                 }
                 while (char != '.' and char != '[' and char != ']' and char != '*' and path_index < path.len) {
                     node_name_buffer.append(char) catch return JsonPathError.OutOfMemory;
@@ -1207,7 +1405,7 @@ pub fn evaluateJsonPathExpression(allocator: std.mem.Allocator, path: []u8, valu
                 // Try to get the next node using the key in the node_name_buffer
                 const next_node = current_node.object.getPtr(node_name_buffer.items);
                 if (next_node == null) {
-                    return undefined;
+                    return null;
                 }
                 current_node = next_node.?;
                 // Clear node_name_buffer
@@ -1271,37 +1469,54 @@ pub fn evaluateJsonPathExpression(allocator: std.mem.Allocator, path: []u8, valu
                 var selector_type: SelectorType = .Unknown;
                 const selector_expression_start_index = path_index;
                 // Read through the entire selector expression (until we hit a ])
-                while (char != ']' and path_index < path.len) {
-                    // We use the character to determine the selector type
-                    switch (char) {
-                        '*' => {
-                            if (selector_type != .Unknown) {
-                                printErr("invalid slice expression: cannot use '*' with ',' or ':'\n", .{});
-                                return JsonPathError.InvalidPath;
-                            }
-                            selector_type = .All;
-                        },
-                        ':' => {
-                            if (selector_type != .Unknown and selector_type != .Slice) {
-                                printErr("invalid slice expression: cannot use ':' with ',' or '*'\n", .{});
-                                return JsonPathError.InvalidPath;
-                            }
-                            selector_type = .Slice;
-                        },
-                        ',' => {
-                            if (selector_type != .Unknown and selector_type != .Pick) {
-                                printErr("invalid slice expression: cannot use ',' with '*' or ':'\n", .{});
-                                return JsonPathError.InvalidPath;
-                            }
-                            selector_type = .Pick;
-                        },
-                        else => {
-                            // If the first character is a ?, then we are evaluating an expression
-                            if (char == '?' and path_index == selector_expression_start_index) {
-                                selector_type = .Expression;
-                            }
-                        },
+                // Track if we're inside a quoted string to properly handle ] inside string literals
+                var in_single_quote: bool = false;
+                var in_double_quote: bool = false;
+                var prev_char: u8 = 0;
+                while ((char != ']' or in_single_quote or in_double_quote) and path_index < path.len) {
+                    // Track quote state (handle escape sequences)
+                    if (char == '\'' and !in_double_quote and prev_char != '\\') {
+                        in_single_quote = !in_single_quote;
+                    } else if (char == '"' and !in_single_quote and prev_char != '\\') {
+                        in_double_quote = !in_double_quote;
                     }
+                    // We use the character to determine the selector type (only when not in a string)
+                    if (!in_single_quote and !in_double_quote) {
+                        switch (char) {
+                            '*' => {
+                                if (selector_type != .Unknown) {
+                                    printErr("invalid slice expression: cannot use '*' with ',' or ':'\n", .{});
+                                    return JsonPathError.InvalidPath;
+                                }
+                                selector_type = .All;
+                            },
+                            ':' => {
+                                if (selector_type != .Unknown and selector_type != .Slice) {
+                                    printErr("invalid slice expression: cannot use ':' with ',' or '*'\n", .{});
+                                    return JsonPathError.InvalidPath;
+                                }
+                                selector_type = .Slice;
+                            },
+                            ',' => {
+                                // Allow commas in Expression selectors (for function arguments like search(@.b, 'pattern'))
+                                if (selector_type != .Unknown and selector_type != .Pick and selector_type != .Expression) {
+                                    printErr("invalid slice expression: cannot use ',' with '*' or ':'\n", .{});
+                                    return JsonPathError.InvalidPath;
+                                }
+                                // Only change selector type if not already Expression
+                                if (selector_type != .Expression) {
+                                    selector_type = .Pick;
+                                }
+                            },
+                            else => {
+                                // If the first character is a ?, then we are evaluating an expression
+                                if (char == '?' and path_index == selector_expression_start_index) {
+                                    selector_type = .Expression;
+                                }
+                            },
+                        }
+                    }
+                    prev_char = char;
                     path_index += 1;
                     if (path_index < path.len) {
                         char = path[path_index];
@@ -1591,7 +1806,6 @@ test "root query 2" {
         \\    "a": 1
         \\}
     , .{});
-    // Initialize an ArrayList to contain the path string
     var path = std.array_list.Managed(u8).init(alloc);
     try path.append('$');
     const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
@@ -1666,9 +1880,7 @@ test "basic slicing" {
     try path.appendSlice("$.store.book[1:3]");
     const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
     try testing.expectEqual(expected_json.array.items.len, result.?.array.items.len);
-    // Loop through the expected array and compare each item
     for (expected_json.array.items, 0..) |item, i| {
-        // Compare the two objects
         try testing.expectEqualDeep(item.object.get("author").?, result.?.array.items[i].object.get("author").?);
         try testing.expectEqualDeep(item.object.get("title").?, result.?.array.items[i].object.get("title").?);
         try testing.expectEqualDeep(item.object.get("isbn").?, result.?.array.items[i].object.get("isbn").?);
@@ -2646,7 +2858,7 @@ const value_test_json =
     \\            { "category": "fiction", "color": "blue" }
     \\        ],
     \\        "bicycle": { "color": "red" }
-    \\    },  
+    \\    },
     \\    "single": { "color": "red" },
     \\    "multiple": [
     \\        { "color": "red" },
@@ -2675,7 +2887,6 @@ test "$[?value(@..color) == 'red']" {
     var root_json: json.Value = undefined;
     root_json = try json.parseFromSliceLeaky(json.Value, alloc, value_test_json, .{});
     var path = std.array_list.Managed(u8).init(alloc);
-    // This should find no matches because value(@..color) returns null when there are multiple nodes
     try path.appendSlice("$[?value(@..color) == 'red']");
     const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
     try testing.expectEqual(0, result.?.array.items.len);
@@ -2688,8 +2899,102 @@ test "$.single[?value(@.nonexistent) == 'red']" {
     var root_json: json.Value = undefined;
     root_json = try json.parseFromSliceLeaky(json.Value, alloc, value_test_json, .{});
     var path = std.array_list.Managed(u8).init(alloc);
-    // This should find no matches because value(@.nonexistent) returns null for empty nodelist
     try path.appendSlice("$.single[?value(@.nonexistent) == 'red']");
     const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
     try testing.expectEqual(0, result.?.array.items.len);
+}
+
+// Unit test for searchBuiltin function
+test "searchBuiltin - basic functionality" {
+    const result1 = searchBuiltin("hello world", "wor");
+    try testing.expectEqual(true, result1.bool);
+
+    const result2 = searchBuiltin("hello world", "xyz");
+    try testing.expectEqual(false, result2.bool);
+
+    const result3 = searchBuiltin("kilo", "[jk]");
+    try testing.expectEqual(true, result3.bool);
+
+    const result4 = searchBuiltin("j", "[jk]");
+    try testing.expectEqual(true, result4.bool);
+
+    const result5 = searchBuiltin("hello", "[jk]");
+    try testing.expectEqual(false, result5.bool);
+}
+
+// Test data for search() function tests (RFC 9535 Section 2.4.7)
+const search_test_json =
+    \\{"a":[3,5,1,2,4,6,{"b":"j"},{"b":"k"},{"b":{}},{"b":"kilo"}],"o":{"p":1,"q":2,"r":3,"s":5,"t":{"u":6}},"e":"f"}
+;
+
+test "search() - RFC example: $.a[?search(@.b, '[jk]')]" {
+    // RFC 9535 Section 2.4.7 example:
+    // Query: $.a[?search(@.b, "[jk]")]
+    // Result: {"b": "j"}, {"b": "k"}, {"b": "kilo"}
+    // Comment: Array value regular expression search
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, search_test_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    try path.appendSlice("$.a[?search(@.b, '[jk]')]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(3, result.?.array.items.len);
+    try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[0].object.get("b").?.string, "j"));
+    try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[1].object.get("b").?.string, "k"));
+    try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[2].object.get("b").?.string, "kilo"));
+}
+
+test "search() - no match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, search_test_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    try path.appendSlice("$.a[?search(@.b, 'xyz')]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(0, result.?.array.items.len);
+}
+
+test "search() - partial match (kilo contains 'il')" {
+    // Test search() with a pattern that matches a substring
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, search_test_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    try path.appendSlice("$.a[?search(@.b, 'il')]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(1, result.?.array.items.len);
+    try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[0].object.get("b").?.string, "kilo"));
+}
+
+test "search() - non-string field returns false" {
+    // Test search() when the field is not a string (e.g., object)
+    // {"b": {}} should not match any pattern
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, search_test_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    try path.appendSlice("$.a[?search(@.b, '.*')]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(3, result.?.array.items.len);
+}
+
+test "search() - string literal first argument" {
+    // Test search() with a string literal as the first argument
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, search_test_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    try path.appendSlice("$.a[?search('hello world', 'wor')]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(10, result.?.array.items.len);
 }

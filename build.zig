@@ -16,10 +16,12 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const mvzr_dep = b.dependency("mvzr", .{});
-    const jsonpath_module = b.addModule("jsonpath", .{
+    _ = b.addModule("jsonpath", .{
         .root_source_file = b.path("jsonpath.zig"),
+        .imports = &.{
+            .{ .name = "mvzr", .module = mvzr_dep.module("mvzr") },
+        },
     });
-    jsonpath_module.addImport("zbench", mvzr_dep.module("mvzr"));
 
     const lib = b.addLibrary(.{
         .linkage = .static,
@@ -42,6 +44,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("jsonpath.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mvzr", .module = mvzr_dep.module("mvzr") },
+            },
         }),
     });
 

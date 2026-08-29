@@ -233,6 +233,35 @@ fn searchBuiltin(haystack: []const u8, pattern: []const u8) json.Value {
     return json.Value{ .bool = false };
 }
 
+// The match() builtin expression function (RFC 9535 Section 2.4.6)
+// Checks whether the entirety of a given string matches a given regular expression.
+// Parameters:
+//   - haystack: ValueType (string) - the string to match against
+//   - pattern: ValueType (string) - the regular expression pattern (I-Regexp per RFC 9485)
+// Result: LogicalType - true if the entire string matches, false otherwise
+// If the first argument is not a string or the second is not a valid regex pattern,
+// the result is LogicalFalse (represented as json.Value{ .bool = false }).
+fn matchBuiltin(haystack: []const u8, pattern: []const u8) json.Value {
+    // Compile the regex pattern using mvzr
+    const regex = mvzr.compile(pattern);
+    if (regex == null) {
+        // Invalid regex pattern - return false
+        return json.Value{ .bool = false };
+    }
+
+    // Use match to find a match in the haystack, then verify it spans the entire string
+    const match_result = regex.?.match(haystack);
+    if (match_result) |m| {
+        // Full match: must start at 0 and end at haystack length
+        if (m.start == 0 and m.end == haystack.len) {
+            return json.Value{ .bool = true };
+        }
+    }
+
+    // No full match found - return false
+    return json.Value{ .bool = false };
+}
+
 // Given a JSON value, return a string name for the type of value it contains
 fn valueTypeName(value: *const ?json.Value) []const u8 {
     if (value.* == null) {
@@ -1024,9 +1053,12 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                         },
                         else => return JsonPathError.InvalidLogicalExpression,
                     }
-                } else if (std.mem.eql(u8, builtin_name_buffer.items, "search")) {
+                } else if (std.mem.eql(u8, builtin_name_buffer.items, "match") or std.mem.eql(u8, builtin_name_buffer.items, "search")) {
+                    // match(haystack, pattern) - RFC 9535 Section 2.4.6
+                    // Checks whether the entirety of a given string matches a regex
                     // search(haystack, pattern) - RFC 9535 Section 2.4.7
                     // Checks whether a given string contains a substring that matches a regex
+                    const is_match_fn = std.mem.eql(u8, builtin_name_buffer.items, "match");
                     if (expression_index >= expression.len) {
                         return JsonPathError.InvalidLogicalExpression;
                     }
@@ -1038,7 +1070,15 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                         return JsonPathError.InvalidLogicalExpression;
                     }
 
-                    // First argument: the string to search in (either @.field or 'string')
+                    // Skip whitespace after opening parenthesis
+                    while (expression_index < expression.len and expression[expression_index] == ' ') {
+                        expression_index += 1;
+                    }
+                    if (expression_index >= expression.len) {
+                        return JsonPathError.InvalidLogicalExpression;
+                    }
+
+                    // First argument: the string to operate on (either @.field or a string literal)
                     var haystack_value: ?[]const u8 = null;
                     switch (expression[expression_index]) {
                         '@' => {
@@ -1054,7 +1094,7 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                             }
                             const evaluated_value = try evaluateJsonPathExpression(allocator, expression_buffer.items, value, .{ .skip_root = true });
                             if (evaluated_value == null) {
-                                // If the path evaluation returns null, search returns false
+                                // If the path evaluation returns null, return false
                                 logical_expressions.append(.{ .value = json.Value{ .bool = false } }) catch return JsonPathError.OutOfMemory;
                                 // Skip to the closing parenthesis
                                 while (expression_index < expression.len and expression[expression_index] != ')') {
@@ -1066,7 +1106,7 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                             // Extract the actual value (may be wrapped in an array)
                             const actual_value = valueBuiltin(&evaluated_value.?);
                             if (actual_value == null) {
-                                // If no single value (empty or multiple results), search returns false
+                                // If no single value (empty or multiple results), return false
                                 logical_expressions.append(.{ .value = json.Value{ .bool = false } }) catch return JsonPathError.OutOfMemory;
                                 // Skip to the closing parenthesis
                                 while (expression_index < expression.len and expression[expression_index] != ')') {
@@ -1077,7 +1117,7 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                             }
                             // The extracted value should be a string
                             if (actual_value.? != .string) {
-                                // If not a string, search returns false
+                                // If not a string, return false
                                 logical_expressions.append(.{ .value = json.Value{ .bool = false } }) catch return JsonPathError.OutOfMemory;
                                 // Skip to the closing parenthesis
                                 while (expression_index < expression.len and expression[expression_index] != ')') {
@@ -1088,13 +1128,14 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                             }
                             haystack_value = actual_value.?.string;
                         },
-                        '\'' => {
+                        '\'', '"' => {
+                            const quote_char = expression[expression_index];
                             expression_index += 1;
-                            // Read the string until we hit another '
+                            // Read the string until we hit the matching closing quote
                             var string_buffer = std.array_list.Managed(u8).init(allocator);
                             var escape_next_char: bool = false;
                             expr_char = expression[expression_index];
-                            while (expression_index < expression.len and (expr_char != '\'' or escape_next_char)) {
+                            while (expression_index < expression.len and (expr_char != quote_char or escape_next_char)) {
                                 if (expr_char == '\\') {
                                     escape_next_char = true;
                                 } else {
@@ -1106,7 +1147,7 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                                     expr_char = expression[expression_index];
                                 }
                             }
-                            if (expression_index >= expression.len or expression[expression_index] != '\'') {
+                            if (expression_index >= expression.len or expression[expression_index] != quote_char) {
                                 return JsonPathError.InvalidLogicalExpression;
                             }
                             expression_index += 1;
@@ -1123,15 +1164,16 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                         return JsonPathError.InvalidLogicalExpression;
                     }
 
-                    // Second argument: the regex pattern (must be a string literal)
-                    if (expression[expression_index] != '\'') {
+                    // Second argument: the regex pattern (must be a string literal, single or double quoted)
+                    const pattern_quote_char = expression[expression_index];
+                    if (pattern_quote_char != '\'' and pattern_quote_char != '"') {
                         return JsonPathError.InvalidLogicalExpression;
                     }
                     expression_index += 1;
                     var pattern_buffer = std.array_list.Managed(u8).init(allocator);
                     var escape_next_char: bool = false;
                     expr_char = expression[expression_index];
-                    while (expression_index < expression.len and (expr_char != '\'' or escape_next_char)) {
+                    while (expression_index < expression.len and (expr_char != pattern_quote_char or escape_next_char)) {
                         if (expr_char == '\\') {
                             escape_next_char = true;
                         } else {
@@ -1143,7 +1185,7 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                             expr_char = expression[expression_index];
                         }
                     }
-                    if (expression_index >= expression.len or expression[expression_index] != '\'') {
+                    if (expression_index >= expression.len or expression[expression_index] != pattern_quote_char) {
                         return JsonPathError.InvalidLogicalExpression;
                     }
                     expression_index += 1;
@@ -1157,9 +1199,14 @@ fn evaluateLogicalExpressionSelector(allocator: std.mem.Allocator, expression: [
                     }
                     expression_index += 1;
 
-                    // Call the searchBuiltin function
-                    const search_result = searchBuiltin(haystack_value.?, pattern_buffer.items);
-                    logical_expressions.append(.{ .value = search_result }) catch return JsonPathError.OutOfMemory;
+                    // Call the appropriate builtin function
+                    if (is_match_fn) {
+                        const match_result = matchBuiltin(haystack_value.?, pattern_buffer.items);
+                        logical_expressions.append(.{ .value = match_result }) catch return JsonPathError.OutOfMemory;
+                    } else {
+                        const search_result = searchBuiltin(haystack_value.?, pattern_buffer.items);
+                        logical_expressions.append(.{ .value = search_result }) catch return JsonPathError.OutOfMemory;
+                    }
                 } else {
                     return JsonPathError.BuiltinNotFound;
                 }
@@ -3081,4 +3128,140 @@ test "search() - string literal first argument" {
     try path.appendSlice("$.a[?search('hello world', 'wor')]");
     const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
     try testing.expectEqual(10, result.?.array.items.len);
+}
+
+// Unit test for matchBuiltin function
+test "matchBuiltin - basic functionality" {
+    // Full match: entire string must match
+    const result1 = matchBuiltin("j", "[jk]");
+    try testing.expectEqual(true, result1.bool);
+
+    const result2 = matchBuiltin("k", "[jk]");
+    try testing.expectEqual(true, result2.bool);
+
+    // "kilo" does NOT fully match "[jk]" (only first char matches, not the whole string)
+    const result3 = matchBuiltin("kilo", "[jk]");
+    try testing.expectEqual(false, result3.bool);
+
+    // Empty string should not match "[jk]"
+    const result4 = matchBuiltin("", "[jk]");
+    try testing.expectEqual(false, result4.bool);
+
+    // Full match with .* pattern
+    const result5 = matchBuiltin("anything", ".*");
+    try testing.expectEqual(true, result5.bool);
+
+    // Single char match with dot
+    const result6 = matchBuiltin("a", ".");
+    try testing.expectEqual(true, result6.bool);
+
+    // Multi-char string should not fully match single dot
+    const result7 = matchBuiltin("ab", ".");
+    try testing.expectEqual(false, result7.bool);
+}
+
+test "match() - RFC example: $.a[?match(@.b, '[jk]')]" {
+    // RFC 9535 Section 2.4.6 example:
+    // Query: $.a[?match(@.b, "[jk]")]
+    // Result: {"b": "j"}, {"b": "k"}
+    // Comment: Array value regular expression match (full match only)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, search_test_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    try path.appendSlice("$.a[?match(@.b, '[jk]')]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    // match() requires full match, so only "j" and "k" match "[jk]", NOT "kilo"
+    try testing.expectEqual(2, result.?.array.items.len);
+    try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[0].object.get("b").?.string, "j"));
+    try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[1].object.get("b").?.string, "k"));
+}
+
+test "match() - double-quoted pattern" {
+    // Test match() with double-quoted pattern string (as in RFC examples)
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, search_test_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    try path.appendSlice("$.a[?match(@.b, \"[jk]\")]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(2, result.?.array.items.len);
+    try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[0].object.get("b").?.string, "j"));
+    try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[1].object.get("b").?.string, "k"));
+}
+
+test "match() - no match" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, search_test_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    try path.appendSlice("$.a[?match(@.b, 'xyz')]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(0, result.?.array.items.len);
+}
+
+test "match() - full match with multi-char pattern" {
+    // "kilo" fully matches "kilo" but not "[jk]"
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, search_test_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    try path.appendSlice("$.a[?match(@.b, 'kilo')]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(1, result.?.array.items.len);
+    try testing.expectEqual(true, std.mem.eql(u8, result.?.array.items[0].object.get("b").?.string, "kilo"));
+}
+
+test "match() - non-string field returns false" {
+    // {"b": {}} should not match any pattern
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, search_test_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    try path.appendSlice("$.a[?match(@.b, '.*')]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    // .* matches "j", "k", and "kilo" fully, but not {} (non-string)
+    try testing.expectEqual(3, result.?.array.items.len);
+}
+
+test "match() - string literal first argument" {
+    // Test match() with a string literal as the first argument
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, search_test_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    // 'hello' fully matches 'hello' pattern - all 10 elements pass the filter
+    try path.appendSlice("$.a[?match('hello', 'hello')]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    try testing.expectEqual(10, result.?.array.items.len);
+}
+
+test "match() - date pattern from RFC" {
+    // RFC example: $[?match(@.date, "1974-05-..")]
+    const date_json =
+        \\[{"date":"1974-05-01"},{"date":"1974-05-22"},{"date":"1975-01-01"},{"date":"1974-05-X"}]
+    ;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var root_json: json.Value = undefined;
+    root_json = try json.parseFromSliceLeaky(json.Value, alloc, date_json, .{});
+    var path = std.array_list.Managed(u8).init(alloc);
+    try path.appendSlice("$[?match(@.date, '1974-05-..')]");
+    const result = try evaluateJsonPathExpression(alloc, path.items, &root_json, .{});
+    // "1974-05-01", "1974-05-22", and "1974-05-X" (only 2 chars after "1974-05-") should match
+    // But "1974-05-X" is only 9 chars while the pattern expects 10 chars (1974-05-..), so it won't match
+    try testing.expectEqual(2, result.?.array.items.len);
 }

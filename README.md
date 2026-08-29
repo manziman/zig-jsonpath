@@ -40,10 +40,10 @@ conformance changes are tracked separately from this safety baseline.
 ### Filter Expressions
 - [x] count() builtin function
 - [x] length() builtin function
-- [ ] match() builtin function
+- [x] match() builtin function
 - [x] search() builtin function
 - [x] value() builtin function
-- [ ] Regular expression pattern matching
+- [x] Regular expression pattern matching
 ### Misc
 - [x] Release automation
 - [ ] Add inline documentation
